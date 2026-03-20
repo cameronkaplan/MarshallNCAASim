@@ -6,17 +6,14 @@
   const compiled = core.compileData(data);
 
   const STORAGE_PREFIX = "marshall-sim-2026";
-  const LEGACY_LOCKED_RESULTS_KEY = STORAGE_PREFIX + "-locked-results";
+  const LOCKED_RESULTS_KEY = STORAGE_PREFIX + "-locked-results";
   const MANUAL_OVERRIDES_KEY = STORAGE_PREFIX + "-manual-overrides";
-  const LIVE_RESULTS_KEY     = STORAGE_PREFIX + "-live-results";
-  const SETTINGS_KEY         = STORAGE_PREFIX + "-settings";
-
-  const initialLiveResults = loadLiveResults();
-  const initialManualOverrides = loadManualOverrides(initialLiveResults);
+  const LIVE_RESULTS_KEY   = STORAGE_PREFIX + "-live-results";
+  const SETTINGS_KEY       = STORAGE_PREFIX + "-settings";
 
   const state = {
-    manualOverrides: initialManualOverrides,
-    liveResults: initialLiveResults,
+    lockedResults: loadLockedResults(),
+    liveResults:   loadLiveResults(),
     seed: loadSettings().seed || Math.floor(Date.now() % 1000000000),
     results: null,
     sampleWinners: null,
@@ -80,53 +77,42 @@
 
   // ─── Persistence ─────────────────────────────────────────────
 
-  function loadStoredSelections(storageKey, label) {
+  function loadLockedResults() {
     try {
-      const raw = window.localStorage.getItem(storageKey);
-      if (raw === null) {
-        return null;
-      }
-      const parsed = JSON.parse(raw);
+      const parsed = JSON.parse(window.localStorage.getItem(LOCKED_RESULTS_KEY) || "null");
       if (parsed && typeof parsed === "object") {
         return core.normalizeRequestedSelections(compiled, parsed);
       }
-    } catch (e) {
-      console.warn("Could not parse " + label + ".", e);
+    } catch (e) { console.warn("Could not parse locked results.", e); }
+
+    try {
+      const parsedManual = JSON.parse(window.localStorage.getItem(MANUAL_OVERRIDES_KEY) || "null");
+      if (parsedManual && typeof parsedManual === "object") {
+        const fallback = core.normalizeRequestedSelections(
+          compiled,
+          Object.assign({}, loadLiveResults(), parsedManual)
+        );
+        window.localStorage.setItem(LOCKED_RESULTS_KEY, JSON.stringify(fallback));
+        return fallback;
+      }
+    } catch (e2) {
+      console.warn("Could not parse manual overrides fallback.", e2);
     }
-    return null;
+
+    return core.normalizeRequestedSelections(compiled, core.defaultLockedResults(compiled));
   }
 
   function loadLiveResults() {
-    return loadStoredSelections(LIVE_RESULTS_KEY, "live results") || {};
-  }
-
-  function loadManualOverrides(initialLive) {
-    const stored = loadStoredSelections(MANUAL_OVERRIDES_KEY, "manual overrides");
-    if (stored) {
-      return stored;
-    }
-
-    const legacy = loadStoredSelections(LEGACY_LOCKED_RESULTS_KEY, "legacy locked results");
-    if (!legacy) {
-      return {};
-    }
-
-    const officialResults = core.normalizeRequestedSelections(
-      compiled,
-      Object.assign({}, core.defaultLockedResults(compiled), initialLive)
-    );
-    const migrated = {};
-
-    Object.keys(legacy).forEach(function eachGame(gameId) {
-      if (legacy[gameId] !== officialResults[gameId]) {
-        migrated[gameId] = legacy[gameId];
+    try {
+      const raw = window.localStorage.getItem(LIVE_RESULTS_KEY);
+      if (raw !== null) {
+        // Key exists (even {} from an explicit Reset All) — use it as-is
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") { return parsed; }
       }
-    });
-
-    const normalized = core.normalizeRequestedSelections(compiled, migrated);
-    window.localStorage.setItem(MANUAL_OVERRIDES_KEY, JSON.stringify(normalized));
-    window.localStorage.removeItem(LEGACY_LOCKED_RESULTS_KEY);
-    return normalized;
+    } catch (e) {}
+    // Key never written: seed with snapshot games from the data as baseline
+    return core.defaultLockedResults(compiled);
   }
 
   function loadSettings() {
@@ -137,8 +123,8 @@
     return {};
   }
 
-  function saveManualOverrides() {
-    window.localStorage.setItem(MANUAL_OVERRIDES_KEY, JSON.stringify(state.manualOverrides));
+  function saveLockedResults() {
+    window.localStorage.setItem(LOCKED_RESULTS_KEY, JSON.stringify(state.lockedResults));
   }
 
   function saveLiveResults() {
@@ -147,56 +133,6 @@
 
   function saveSettings() {
     window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ seed: state.seed }));
-  }
-
-  function getOfficialSelections() {
-    return core.normalizeRequestedSelections(
-      compiled,
-      Object.assign({}, core.defaultLockedResults(compiled), state.liveResults)
-    );
-  }
-
-  function getExplicitSelections() {
-    return Object.assign({}, getOfficialSelections(), state.manualOverrides);
-  }
-
-  function selectionMapsEqual(a, b) {
-    const keysA = Object.keys(a);
-    const keysB = Object.keys(b);
-    if (keysA.length !== keysB.length) {
-      return false;
-    }
-    for (var i = 0; i < keysA.length; i += 1) {
-      const key = keysA[i];
-      if (a[key] !== b[key]) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  function invalidateSimulationOutputs(message) {
-    state.results = null;
-    state.sampleWinners = null;
-    state.dirty = true;
-    els.winnerBanner.hidden = true;
-    els.exportSummaryButton.disabled = true;
-    els.exportScoresButton.disabled = true;
-    renderBracket(null, null);
-    renderStatsBar();
-    renderOutlookTab();
-    renderLeadersTab();
-    renderStatusBar(message);
-  }
-
-  function commitManualOverrides(nextOverrides, message) {
-    const normalized = core.normalizeRequestedSelections(compiled, nextOverrides);
-    if (selectionMapsEqual(normalized, state.manualOverrides)) {
-      return;
-    }
-    state.manualOverrides = normalized;
-    saveManualOverrides();
-    invalidateSimulationOutputs(message);
   }
 
   // ─── Tabs ────────────────────────────────────────────────────
@@ -210,7 +146,7 @@
       panel.classList.toggle("tab-panel--active", panel.id === "tab-" + tabName);
     });
     if (tabName === "leaders") { renderLeadersTab(); }
-    if (tabName === "outlook") { renderOutlookTab(); }
+    if (tabName === "outlook" && state.results) { renderOutlookTab(); }
   }
 
   // ─── Controls ────────────────────────────────────────────────
@@ -244,19 +180,28 @@
     });
 
     els.resetButton.addEventListener("click", function () {
-      state.manualOverrides = {};
-      saveManualOverrides();
-      invalidateSimulationOutputs("Manual overrides cleared. Official results restored.");
+      // Restore to all known completed results: snapshot games + ESPN live results
+      const base = Object.assign({}, core.defaultLockedResults(compiled), state.liveResults);
+      state.lockedResults = core.normalizeRequestedSelections(compiled, base);
+      state.sampleWinners = null;
+      state.dirty = true;
+      saveLockedResults();
+      els.winnerBanner.hidden = true;
+      renderBracket(null, state.results ? state.results.gameProbabilities : null);
+      renderStatusBar("Manual locks cleared. All completed game results restored.");
     });
 
     els.resetAllButton.addEventListener("click", function () {
+      // Clear everything — live results and manual locks — blank slate
       state.liveResults = {};
-      state.manualOverrides = {};
+      state.lockedResults = core.normalizeRequestedSelections(compiled, {});
       saveLiveResults();
-      saveManualOverrides();
-      invalidateSimulationOutputs(
-        "Local overrides and ESPN cache cleared. Snapshot results remain until the next sync."
-      );
+      state.sampleWinners = null;
+      state.dirty = true;
+      saveLockedResults();
+      els.winnerBanner.hidden = true;
+      renderBracket(null, state.results ? state.results.gameProbabilities : null);
+      renderStatusBar("All results cleared. Tournament reset to pre-game state.");
     });
 
     els.exportSummaryButton.addEventListener("click", function () {
@@ -274,14 +219,21 @@
       const teamSlug = slot.getAttribute("data-team-slug");
       if (!gameId || !teamSlug) { return; }
 
-      const officialSelections = getOfficialSelections();
-      const nextOverrides = Object.assign({}, state.manualOverrides);
-      const currentManual = nextOverrides[gameId] || null;
-      delete nextOverrides[gameId];
-      if (currentManual !== teamSlug && officialSelections[gameId] !== teamSlug) {
-        nextOverrides[gameId] = teamSlug;
+      const nextLocked = Object.assign({}, state.lockedResults);
+      // Toggle: clicking locked winner removes it
+      if (nextLocked[gameId] === teamSlug) {
+        delete nextLocked[gameId];
+      } else {
+        nextLocked[gameId] = teamSlug;
       }
-      commitManualOverrides(nextOverrides, "Result updated.");
+      state.lockedResults = core.normalizeRequestedSelections(compiled, nextLocked);
+      state.sampleWinners = null;
+      state.dirty = true;
+      saveLockedResults();
+      els.winnerBanner.hidden = true;
+      renderBracket(null, state.results ? state.results.gameProbabilities : null);
+      if (state.activeTab === "leaders") { renderLeadersTab(); }
+      renderStatusBar("Result updated. Rerun simulations to refresh projections.");
     });
 
     // Override select (for unresolved-slot games)
@@ -290,22 +242,27 @@
       if (!sel) { return; }
       const gameId   = sel.getAttribute("data-game-id");
       const nextValue = sel.value;
-      const officialSelections = getOfficialSelections();
-      const nextOverrides = Object.assign({}, state.manualOverrides);
-      delete nextOverrides[gameId];
-      if (nextValue && officialSelections[gameId] !== nextValue) {
-        nextOverrides[gameId] = nextValue;
-      }
-      commitManualOverrides(nextOverrides, "Override applied.");
+      const nextLocked = Object.assign({}, state.lockedResults);
+      delete nextLocked[gameId];
+      if (nextValue) { nextLocked[gameId] = nextValue; }
+      state.lockedResults = core.normalizeRequestedSelections(compiled, nextLocked);
+      state.sampleWinners = null;
+      state.dirty = true;
+      saveLockedResults();
+      els.winnerBanner.hidden = true;
+      renderBracket(null, state.results ? state.results.gameProbabilities : null);
+      if (state.activeTab === "leaders") { renderLeadersTab(); }
+      renderStatusBar("Override applied. Rerun simulations to refresh projections.");
     });
   }
 
   // ─── Simulate Once ───────────────────────────────────────────
 
   function simulateOnce() {
+    saveLockedResults();
     const oneResult = core.runOneBracket(compiled, {
       seed: state.seed,
-      lockedResults: getExplicitSelections(),
+      lockedResults: state.lockedResults,
     });
     state.sampleWinners = oneResult.winnersByGameId;
 
@@ -326,6 +283,7 @@
   // ─── Run 10,000 ──────────────────────────────────────────────
 
   function runSimulations() {
+    saveLockedResults();
     els.runButton.disabled = true;
     renderStatusBar("Running 10,000 simulations…");
 
@@ -333,7 +291,7 @@
       state.results = core.runSimulations(compiled, {
         simulations: 10000,
         seed: state.seed,
-        lockedResults: getExplicitSelections(),
+        lockedResults: state.lockedResults,
       });
       state.dirty = false;
       els.runButton.disabled = false;
@@ -354,7 +312,7 @@
   // ─── Bracket ─────────────────────────────────────────────────
 
   function renderBracket(sampleWinners, gameProbabilities) {
-    const gameStates = core.getGameStates(compiled, getExplicitSelections());
+    const gameStates = core.getGameStates(compiled, state.lockedResults);
     const byId = {};
     gameStates.forEach(function (g) { byId[g.id] = g; });
 
@@ -435,7 +393,7 @@
 
       const classes = ["matchup"];
       if (extraClass) { classes.push(extraClass); }
-      if (state.manualOverrides[game.id]) { classes.push("has-override"); }
+      if (game.requestedSelection) { classes.push("has-override"); }
 
       const slotAHtml = renderTeamSlot(game.id, slugA, labelA, winA, isSimulated && winA, probA);
       const slotBHtml = renderTeamSlot(game.id, slugB, labelB, winB, isSimulated && winB, probB);
@@ -515,10 +473,7 @@
   // ─── Stats Bar ───────────────────────────────────────────────
 
   function renderStatsBar() {
-    if (!state.results) {
-      els.statsBar.innerHTML = "";
-      return;
-    }
+    if (!state.results) { return; }
     const r = state.results;
     const top = r.participants[0];
     const second = r.participants.slice().sort(function (a, b) { return b.secondRate - a.secondRate; })[0];
@@ -545,7 +500,7 @@
   // ─── Team Disclosure Helpers ──────────────────────────────────
 
   function computeEliminatedSlugs() {
-    const gameStates = core.getGameStates(compiled, getExplicitSelections());
+    const gameStates = core.getGameStates(compiled, state.lockedResults);
     const eliminated = new Set();
     gameStates.forEach(function (game) {
       if (game.lockedWinner && game.teamA && game.teamB) {
@@ -588,7 +543,7 @@
   // ─── Leaders Tab ─────────────────────────────────────────────
 
   function renderLeadersTab() {
-    const standings = core.computeLockedScoreboard(compiled, getExplicitSelections());
+    const standings = core.computeLockedScoreboard(compiled, state.lockedResults);
     const topScore = standings.length ? standings[0].currentPoints : 0;
     const eliminatedSlugs = computeEliminatedSlugs();
 
@@ -599,7 +554,7 @@
       });
     }
 
-    const gamesLocked = Object.keys(core.sanitizeLockedResults(compiled, getExplicitSelections())).length;
+    const gamesLocked = Object.keys(core.sanitizeLockedResults(compiled, state.lockedResults)).length;
     els.leadersNote.textContent = gamesLocked + " game" + (gamesLocked !== 1 ? "s" : "") + " locked";
 
     els.leadersBody.innerHTML = standings
@@ -626,10 +581,7 @@
   // ─── Outlook Tab (Monte Carlo projections) ───────────────────
 
   function renderOutlookTab() {
-    if (!state.results) {
-      els.leaderboardBody.innerHTML = "";
-      return;
-    }
+    if (!state.results) { return; }
     const eliminatedSlugs = computeEliminatedSlugs();
     els.leaderboardBody.innerHTML = state.results.participants
       .map(function (p, index) {
@@ -653,7 +605,7 @@
   // ─── Status Bar ──────────────────────────────────────────────
 
   function renderStatusBar(message) {
-    const dirty = state.dirty ? "<span class=\"dirty-flag\"> · Bracket changed — rerun projections.</span>" : "";
+    const dirty = state.dirty ? "<span class=\"dirty-flag\"> · Overrides pending — rerun projections.</span>" : "";
     els.statusBar.innerHTML = "<span>" + escapeHtml(message) + dirty + "</span>";
   }
 
@@ -773,7 +725,7 @@
       })
       .then(function (json) {
         const events = json.events || [];
-        var synced = 0;
+        var applied = 0;
 
         events.forEach(function (event) {
           try {
@@ -800,19 +752,35 @@
             const winner0 = Boolean(c0.winner);
             const winnerSlug = winner0 ? slug0 : slug1;
 
-            if (state.liveResults[gameId] === winnerSlug) { return; }
+            // Record in liveResults regardless (source of truth for completed games)
+            if (state.liveResults[gameId] === winnerSlug) { return; } // already known
             state.liveResults[gameId] = winnerSlug;
-            synced += 1;
+
+            // Only apply to lockedResults if not manually overridden
+            if (!state.lockedResults[gameId]) {
+              const nextLocked = Object.assign({}, state.lockedResults);
+              nextLocked[gameId] = winnerSlug;
+              const normalized = core.normalizeRequestedSelections(compiled, nextLocked);
+              if (normalized[gameId]) {
+                state.lockedResults = normalized;
+                applied += 1;
+              }
+            }
           } catch (e) {
             console.warn("Error processing ESPN event", e);
           }
         });
 
-        if (synced > 0) {
+        if (applied > 0) {
           saveLiveResults();
-          invalidateSimulationOutputs(
-            synced + " official result" + (synced !== 1 ? "s" : "") + " synced from ESPN."
-          );
+          saveLockedResults();
+          state.dirty = true;
+          renderBracket(null, state.results ? state.results.gameProbabilities : null);
+          if (!silent) {
+            renderStatusBar(applied + " new result" + (applied !== 1 ? "s" : "") + " synced from ESPN.");
+          } else {
+            renderStatusBar(applied + " new result" + (applied !== 1 ? "s" : "") + " from ESPN · rerun for updated projections.");
+          }
         } else if (!silent) {
           renderStatusBar("Up to date — no new results from ESPN.");
         }
@@ -828,7 +796,7 @@
   // ─── Game Override Options ────────────────────────────────────
 
   function buildGameOptionMarkup(game) {
-    const selectedValue = state.manualOverrides[game.id] || "";
+    const selectedValue = game.requestedSelection || "";
     const chunks = ["<option value=\"\"" + selectedAttr(selectedValue === "") + ">Auto simulate</option>"];
 
     if (game.slotA && game.slotA.type === "game" && !game.teamA) {

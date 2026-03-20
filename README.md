@@ -12,7 +12,6 @@ Static simulator for Marshall's NCAA pool using:
 - Tracks first-place ties separately from outright winners.
 - Identifies second place by the next distinct score below first.
 - Lets you lock a game to either a specific team or an unresolved upstream slot winner.
-- Keeps official results separate from your manual overrides, so ESPN updates can correct the bracket without wiping out what-if picks.
 - Exports both a participant summary CSV and a full simulation-by-simulation score matrix.
 
 ## Files
@@ -47,5 +46,3 @@ Open `index.html` in a browser. The page is self-contained and loads its data fr
 - The simulator uses Boxscorus-published round-of-64 probabilities when they are directly available in the snapshot.
 - All later open games use an Elo-based win model calibrated from the Boxscorus team ratings embedded in the same snapshot.
 - First Four games do not score in Marshall's pool.
-- `Reset Locks` clears only your manual overrides and restores official results.
-- `Clear Local State` clears the cached ESPN results and manual overrides; the embedded snapshot remains, and ESPN will repopulate current results on the next sync.
