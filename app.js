@@ -4,17 +4,21 @@
   const data = window.MARSHALL_SIM_DATA;
   const core = window.MarshallSimCore;
   const compiled = core.compileData(data);
+  const runtimeOptions = readRuntimeOptions();
+  const blankScenario = runtimeOptions.blankScenario;
 
   const STORAGE_PREFIX = "marshall-sim-2026";
   const LOCKED_RESULTS_KEY = STORAGE_PREFIX + "-locked-results";
   const MANUAL_OVERRIDES_KEY = STORAGE_PREFIX + "-manual-overrides";
   const LIVE_RESULTS_KEY   = STORAGE_PREFIX + "-live-results";
   const SETTINGS_KEY       = STORAGE_PREFIX + "-settings";
+  const loadedSettings = loadSettings();
 
   const state = {
     lockedResults: loadLockedResults(),
     liveResults:   loadLiveResults(),
-    seed: loadSettings().seed || Math.floor(Date.now() % 1000000000),
+    seed: loadedSettings.seed || Math.floor(Date.now() % 1000000000),
+    simulations: normalizeSimulationCount(loadedSettings.simulations),
     results: null,
     sampleWinners: null,
     activeTab: "bracket",
@@ -27,16 +31,17 @@
 
   const els = {
     seed:               document.querySelector("#simulation-seed"),
+    simulationCount:    document.querySelector("#simulation-count"),
     simulateOnce:       document.querySelector("#simulate-once"),
     runButton:          document.querySelector("#run-simulations"),
     randomizeSeed:      document.querySelector("#randomize-seed"),
     resetButton:        document.querySelector("#reset-results"),
-    resetAllButton:     document.querySelector("#reset-all"),
     exportSummaryButton:document.querySelector("#export-summary"),
     exportScoresButton: document.querySelector("#export-scores"),
     winnerBanner:       document.querySelector("#winner-banner"),
     winnerBannerText:   document.querySelector("#winner-banner-text"),
     statusBar:          document.querySelector("#status-bar"),
+    scenarioIndicator:  document.querySelector("#scenario-indicator"),
     bracketHost:        document.querySelector("#bracket-host"),
     statsBar:           document.querySelector("#stats-bar"),
     leadersBody:        document.querySelector("#leaders-body"),
@@ -63,10 +68,20 @@
 
   function init() {
     els.seed.value = state.seed;
+    els.simulationCount.value = state.simulations;
+    updateRunButtonLabel();
+    if (blankScenario && els.scenarioIndicator) {
+      els.scenarioIndicator.hidden = false;
+    }
     renderFooter();
     wireControls();
     renderBracket(null, null);
-    renderStatusBar("Ready. Click Simulate for one outcome, or Run 10,000 for projections.");
+    if (blankScenario) {
+      renderStatusBar("Blank scenario mode. Starting from an empty bracket.");
+      window.setTimeout(runSimulations, 0);
+      return;
+    }
+    renderStatusBar("Ready. Click Simulate for one outcome, or run projections.");
     // Auto sync live results, then run sims
     syncLive().then(function () {
       window.setTimeout(runSimulations, 0);
@@ -78,6 +93,9 @@
   // ─── Persistence ─────────────────────────────────────────────
 
   function loadLockedResults() {
+    if (blankScenario) {
+      return {};
+    }
     try {
       const parsed = JSON.parse(window.localStorage.getItem(LOCKED_RESULTS_KEY) || "null");
       if (parsed && typeof parsed === "object") {
@@ -103,10 +121,12 @@
   }
 
   function loadLiveResults() {
+    if (blankScenario) {
+      return {};
+    }
     try {
       const raw = window.localStorage.getItem(LIVE_RESULTS_KEY);
       if (raw !== null) {
-        // Key exists (even {} from an explicit Reset All) — use it as-is
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === "object") { return parsed; }
       }
@@ -116,6 +136,9 @@
   }
 
   function loadSettings() {
+    if (blankScenario) {
+      return {};
+    }
     try {
       const parsed = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) || "null");
       if (parsed && typeof parsed === "object") { return parsed; }
@@ -124,15 +147,31 @@
   }
 
   function saveLockedResults() {
+    if (blankScenario) { return; }
     window.localStorage.setItem(LOCKED_RESULTS_KEY, JSON.stringify(state.lockedResults));
   }
 
   function saveLiveResults() {
+    if (blankScenario) { return; }
     window.localStorage.setItem(LIVE_RESULTS_KEY, JSON.stringify(state.liveResults));
   }
 
   function saveSettings() {
-    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ seed: state.seed }));
+    if (blankScenario) { return; }
+    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      seed: state.seed,
+      simulations: state.simulations,
+    }));
+  }
+
+  function getBaselineLockedResults() {
+    if (blankScenario) {
+      return {};
+    }
+    return core.normalizeRequestedSelections(
+      compiled,
+      Object.assign({}, core.defaultLockedResults(compiled), state.liveResults)
+    );
   }
 
   // ─── Tabs ────────────────────────────────────────────────────
@@ -169,7 +208,10 @@
 
     els.runButton.addEventListener("click", function () {
       state.seed = Number(els.seed.value) || Math.floor(Date.now() % 1000000000);
+      state.simulations = readSimulationCountInput();
+      els.simulationCount.value = state.simulations;
       saveSettings();
+      updateRunButtonLabel();
       runSimulations();
     });
 
@@ -179,29 +221,23 @@
       saveSettings();
     });
 
-    els.resetButton.addEventListener("click", function () {
-      // Restore to all known completed results: snapshot games + ESPN live results
-      const base = Object.assign({}, core.defaultLockedResults(compiled), state.liveResults);
-      state.lockedResults = core.normalizeRequestedSelections(compiled, base);
-      state.sampleWinners = null;
-      state.dirty = true;
-      saveLockedResults();
-      els.winnerBanner.hidden = true;
-      renderBracket(null, state.results ? state.results.gameProbabilities : null);
-      renderStatusBar("Manual locks cleared. All completed game results restored.");
+    els.simulationCount.addEventListener("change", function () {
+      state.simulations = readSimulationCountInput();
+      els.simulationCount.value = state.simulations;
+      saveSettings();
+      updateRunButtonLabel();
     });
 
-    els.resetAllButton.addEventListener("click", function () {
-      // Clear everything — live results and manual locks — blank slate
-      state.liveResults = {};
-      state.lockedResults = core.normalizeRequestedSelections(compiled, {});
-      saveLiveResults();
+    els.resetButton.addEventListener("click", function () {
+      state.lockedResults = getBaselineLockedResults();
       state.sampleWinners = null;
       state.dirty = true;
       saveLockedResults();
       els.winnerBanner.hidden = true;
       renderBracket(null, state.results ? state.results.gameProbabilities : null);
-      renderStatusBar("All results cleared. Tournament reset to pre-game state.");
+      renderStatusBar(blankScenario
+        ? "Blank scenario reset to an empty bracket."
+        : "Manual locks cleared. All completed game results restored.");
     });
 
     els.exportSummaryButton.addEventListener("click", function () {
@@ -280,16 +316,16 @@
     renderStatusBar("Simulated 1 outcome · seed " + numberFormat.format(state.seed) + ".");
   }
 
-  // ─── Run 10,000 ──────────────────────────────────────────────
+  // ─── Run Simulations ─────────────────────────────────────────
 
   function runSimulations() {
     saveLockedResults();
     els.runButton.disabled = true;
-    renderStatusBar("Running 10,000 simulations…");
+    renderStatusBar("Running " + numberFormat.format(state.simulations) + " simulations…");
 
     window.setTimeout(function () {
       state.results = core.runSimulations(compiled, {
-        simulations: 10000,
+        simulations: state.simulations,
         seed: state.seed,
         lockedResults: state.lockedResults,
       });
@@ -303,7 +339,7 @@
       els.exportScoresButton.disabled = false;
       switchTab("outlook");
       renderStatusBar(
-        "10,000 sims complete · seed " + numberFormat.format(state.seed) +
+        numberFormat.format(state.simulations) + " sims complete · seed " + numberFormat.format(state.seed) +
         " · probabilities shown in bracket."
       );
     }, 10);
@@ -714,6 +750,9 @@
   }
 
   function syncLive(silent) {
+    if (blankScenario) {
+      return Promise.resolve();
+    }
     const espnUrl =
       "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard" +
       "?seasontype=3&limit=200";
@@ -886,5 +925,35 @@
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
+  }
+
+  function normalizeSimulationCount(value) {
+    const fallback = Math.max(1, Math.floor(compiled.defaultRuns || 10000));
+    const count = Number(value);
+    if (!Number.isFinite(count)) {
+      return fallback;
+    }
+    return Math.max(1, Math.floor(count));
+  }
+
+  function readSimulationCountInput() {
+    return normalizeSimulationCount(els.simulationCount.value);
+  }
+
+  function updateRunButtonLabel() {
+    els.runButton.textContent = "Run " + numberFormat.format(state.simulations);
+  }
+
+  function readRuntimeOptions() {
+    try {
+      const params = new window.URLSearchParams(window.location.search || "");
+      return {
+        blankScenario: params.get("scenario") === "blank",
+      };
+    } catch (e) {
+      return {
+        blankScenario: false,
+      };
+    }
   }
 })();

@@ -61,11 +61,32 @@ input, select, button { font: inherit; }
 }
 
 .app-bar-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 700;
   font-size: 0.95rem;
   color: var(--accent-soft);
   white-space: nowrap;
   margin-right: 6px;
+}
+
+.scenario-indicator {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(240, 188, 113, 0.12);
+  border: 1px solid rgba(240, 188, 113, 0.22);
+  color: rgba(255, 249, 236, 0.78);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.scenario-indicator[hidden] {
+  display: none;
 }
 
 .app-bar-controls {

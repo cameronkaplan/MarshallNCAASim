@@ -8,7 +8,10 @@
   </head>
   <body>
     <header class="app-bar">
-      <div class="app-bar-title">Marshall's Pool · 2026 NCAA</div>
+      <div class="app-bar-title">
+        <span>Marshall's Pool · 2026 NCAA</span>
+        <span class="scenario-indicator" id="scenario-indicator" hidden>Blank Scenario</span>
+      </div>
       <div class="app-bar-controls">
         <button class="button-primary" id="simulate-once">Simulate</button>
         <button class="button-secondary" id="run-simulations">Run 10,000</button>
@@ -17,8 +20,11 @@
           <input id="simulation-seed" type="number" min="0" step="1" />
           <button class="button-ghost" id="randomize-seed">New Seed</button>
         </div>
+        <div class="seed-group">
+          <label for="simulation-count">Sims</label>
+          <input id="simulation-count" type="number" min="1" step="1" />
+        </div>
         <button class="button-ghost" id="reset-results">Reset Locks</button>
-        <button class="button-ghost" id="reset-all">Reset All</button>
       </div>
     </header>
 
