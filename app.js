@@ -83,7 +83,7 @@
     }
     renderStatusBar("Ready. Click Simulate for one outcome, or run projections.");
     // Auto sync live results, then run sims
-    syncLive().then(function () {
+    syncLive(false, true).then(function () {
       window.setTimeout(runSimulations, 0);
     });
     // Re-sync silently every 3 minutes
@@ -668,10 +668,23 @@
   }
 
   function buildEspnNameMap() {
-    // Auto-populate from compiled team names
     const map = new Map();
+    const ambiguousKeys = new Set();
+
     compiled.teams.forEach(function (team) {
-      map.set(normalizeName(team.name), team.slug);
+      const key = normalizeName(team.name);
+      if (!key) { return; }
+      if (!map.has(key)) {
+        map.set(key, team.slug);
+        return;
+      }
+      if (map.get(key) !== team.slug) {
+        ambiguousKeys.add(key);
+      }
+    });
+
+    ambiguousKeys.forEach(function eachAmbiguousKey(key) {
+      map.delete(key);
     });
 
     // Manual aliases for ESPN display name variants
@@ -698,15 +711,25 @@
       "central florida":      "ucf",
       "virginia commonwealth":"vcu",
       "brigham young":        "byu",
+      "byu cougars":          "byu",
       "cal baptist":          "california-baptist",
+      "california baptist lancers":"california-baptist",
       "prairie view am":      "prairie-view",
       "prairie view a m":     "prairie-view",
       "st johns":             "st-johns-ny",
       "saint marys":          "st-marys-ca",
+      "hawai i":              "hawaii",
+      "hawai i rainbow warriors":"hawaii",
+      "n dakota st":          "north-dakota-st",
+      "north dakota state bison":"north-dakota-st",
+      "mia":                  "miami-fl",
+      "m oh":                 "miami-oh",
       "miami oh":             "miami-oh",
       "miami fl":             "miami-fl",
       "miami ohio":           "miami-oh",
       "miami florida":        "miami-fl",
+      "miami hurricanes":     "miami-fl",
+      "miami redhawks":       "miami-oh",
     };
 
     Object.keys(aliases).forEach(function (key) {
@@ -749,22 +772,102 @@
     return result;
   }
 
-  function syncLive(silent) {
+  function resolveEspnTeamSlug(team) {
+    if (!team) { return null; }
+    const candidates = [
+      normalizeName(team.abbreviation || ""),
+      normalizeName(team.shortDisplayName || ""),
+      normalizeName(team.displayName || ""),
+      normalizeName(team.name || ""),
+    ];
+
+    for (var i = 0; i < candidates.length; i += 1) {
+      const candidate = candidates[i];
+      if (!candidate) { continue; }
+      const slug = espnNameMap.get(candidate);
+      if (slug) {
+        return slug;
+      }
+    }
+    return null;
+  }
+
+  function buildEspnScoreboardUrls(fullSync) {
+    const baseUrl =
+      "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard" +
+      "?seasontype=3&groups=50&limit=500&dates=";
+    const urls = [];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const startDate = new Date(today);
+    startDate.setFullYear(Number(data.meta && data.meta.season) || today.getFullYear(), 2, 17);
+    startDate.setHours(0, 0, 0, 0);
+    var lookbackDays = 3;
+
+    if (fullSync) {
+      lookbackDays = Math.max(1, Math.floor((today - startDate) / 86400000) + 1);
+    }
+
+    for (var dayOffset = 0; dayOffset < lookbackDays; dayOffset += 1) {
+      const date = new Date(today);
+      date.setDate(today.getDate() - dayOffset);
+      urls.push(baseUrl + formatEspnDate(date));
+    }
+
+    return urls;
+  }
+
+  function formatEspnDate(date) {
+    const year = String(date.getFullYear());
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return year + month + day;
+  }
+
+  function syncLive(silent, fullSync) {
     if (blankScenario) {
       return Promise.resolve();
     }
-    const espnUrl =
-      "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard" +
-      "?seasontype=3&limit=200";
+    const espnUrls = buildEspnScoreboardUrls(Boolean(fullSync));
 
-    return fetch(espnUrl)
-      .then(function (res) {
-        if (!res.ok) { throw new Error("ESPN API " + res.status); }
-        return res.json();
-      })
-      .then(function (json) {
-        const events = json.events || [];
-        var applied = 0;
+    return Promise.allSettled(espnUrls.map(function (espnUrl) {
+      return fetch(espnUrl)
+        .then(function (res) {
+          if (!res.ok) { throw new Error("ESPN API " + res.status); }
+          return res.json();
+        });
+    }))
+      .then(function (results) {
+        const payloads = [];
+        let firstError = null;
+        results.forEach(function eachResult(result) {
+          if (result.status === "fulfilled") {
+            payloads.push(result.value);
+          } else if (!firstError) {
+            firstError = result.reason;
+          }
+        });
+
+        if (!payloads.length) {
+          throw firstError || new Error("ESPN API unavailable");
+        }
+
+        const eventsById = {};
+        payloads.forEach(function eachPayload(json) {
+          (json.events || []).forEach(function eachEvent(event) {
+            if (event && event.id) {
+              eventsById[event.id] = event;
+            }
+          });
+        });
+
+        const events = Object.keys(eventsById).map(function eachId(eventId) {
+          return eventsById[eventId];
+        });
+        const previousLiveResults = Object.assign({}, state.liveResults);
+        const nextLiveResults = Object.assign({}, core.defaultLockedResults(compiled));
+        const changedGameIds = new Set();
+        var matched = 0;
 
         events.forEach(function (event) {
           try {
@@ -772,17 +875,20 @@
             if (!competition) { return; }
             const completed = event.status && event.status.type && event.status.type.completed;
             if (!completed) { return; }
+            const noteHeadline = competition.notes &&
+              competition.notes[0] &&
+              competition.notes[0].headline;
+            if (noteHeadline && noteHeadline.indexOf("NCAA Men's Basketball Championship") === -1) {
+              return;
+            }
 
             const competitors = competition.competitors || [];
             if (competitors.length !== 2) { return; }
 
             const c0 = competitors[0];
             const c1 = competitors[1];
-            const name0 = normalizeName(c0.team && (c0.team.shortDisplayName || c0.team.displayName || ""));
-            const name1 = normalizeName(c1.team && (c1.team.shortDisplayName || c1.team.displayName || ""));
-
-            const slug0 = espnNameMap.get(name0);
-            const slug1 = espnNameMap.get(name1);
+            const slug0 = resolveEspnTeamSlug(c0.team);
+            const slug1 = resolveEspnTeamSlug(c1.team);
             if (!slug0 || !slug1) { return; }
 
             const gameId = slugToGameId(slug0, slug1);
@@ -790,38 +896,76 @@
 
             const winner0 = Boolean(c0.winner);
             const winnerSlug = winner0 ? slug0 : slug1;
-
-            // Record in liveResults regardless (source of truth for completed games)
-            if (state.liveResults[gameId] === winnerSlug) { return; } // already known
-            state.liveResults[gameId] = winnerSlug;
-
-            // Only apply to lockedResults if not manually overridden
-            if (!state.lockedResults[gameId]) {
-              const nextLocked = Object.assign({}, state.lockedResults);
-              nextLocked[gameId] = winnerSlug;
-              const normalized = core.normalizeRequestedSelections(compiled, nextLocked);
-              if (normalized[gameId]) {
-                state.lockedResults = normalized;
-                applied += 1;
-              }
-            }
+            nextLiveResults[gameId] = winnerSlug;
+            matched += 1;
           } catch (e) {
             console.warn("Error processing ESPN event", e);
           }
         });
 
-        if (applied > 0) {
+        Object.keys(previousLiveResults).forEach(function eachGameId(gameId) {
+          if ((previousLiveResults[gameId] || null) !== (nextLiveResults[gameId] || null)) {
+            changedGameIds.add(gameId);
+          }
+        });
+        Object.keys(nextLiveResults).forEach(function eachGameId(gameId) {
+          if ((previousLiveResults[gameId] || null) !== (nextLiveResults[gameId] || null)) {
+            changedGameIds.add(gameId);
+          }
+        });
+
+        const nextLockedRaw = Object.assign({}, state.lockedResults);
+        changedGameIds.forEach(function eachChangedGame(gameId) {
+          const previousWinnerSlug = previousLiveResults[gameId] || null;
+          const nextWinnerSlug = nextLiveResults[gameId] || null;
+          const currentLockedWinner = nextLockedRaw[gameId] || null;
+
+          if (!currentLockedWinner) {
+            if (nextWinnerSlug) {
+              nextLockedRaw[gameId] = nextWinnerSlug;
+            }
+            return;
+          }
+
+          if (currentLockedWinner !== previousWinnerSlug) {
+            return;
+          }
+
+          if (nextWinnerSlug) {
+            nextLockedRaw[gameId] = nextWinnerSlug;
+          } else {
+            delete nextLockedRaw[gameId];
+          }
+        });
+
+        const normalizedLockedResults = core.normalizeRequestedSelections(compiled, nextLockedRaw);
+        const liveChanged = JSON.stringify(previousLiveResults) !== JSON.stringify(nextLiveResults);
+        const lockedChanged = JSON.stringify(state.lockedResults) !== JSON.stringify(normalizedLockedResults);
+
+        if (liveChanged) {
+          state.liveResults = nextLiveResults;
           saveLiveResults();
+        }
+        if (lockedChanged) {
+          state.lockedResults = normalizedLockedResults;
           saveLockedResults();
           state.dirty = true;
           renderBracket(null, state.results ? state.results.gameProbabilities : null);
-          if (!silent) {
-            renderStatusBar(applied + " new result" + (applied !== 1 ? "s" : "") + " synced from ESPN.");
-          } else {
-            renderStatusBar(applied + " new result" + (applied !== 1 ? "s" : "") + " from ESPN · rerun for updated projections.");
+        }
+
+        if (liveChanged || lockedChanged) {
+          if (!silent || lockedChanged) {
+            const synced = changedGameIds.size;
+            if (lockedChanged) {
+              renderStatusBar(synced + " official result" + (synced !== 1 ? "s" : "") + " synced from ESPN.");
+            } else {
+              renderStatusBar(synced + " official result" + (synced !== 1 ? "s" : "") + " refreshed from ESPN.");
+            }
           }
         } else if (!silent) {
-          renderStatusBar("Up to date — no new results from ESPN.");
+          renderStatusBar(matched > 0
+            ? "Up to date — no new results from ESPN."
+            : "ESPN sync returned no completed tournament games.");
         }
       })
       .catch(function (err) {
