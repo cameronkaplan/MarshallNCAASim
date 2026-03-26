@@ -17,6 +17,7 @@ DEFAULT_WORKBOOK = ROOT / "NCAA_2026_Teams.xlsx"
 DEFAULT_JSON_OUTPUT = ROOT / "data" / "marshall-simulator-data.json"
 DEFAULT_JS_OUTPUT = ROOT / "app-data.js"
 DEFAULT_SNAPSHOT = ROOT / "data" / "source" / "boxscorus-march-madness.html"
+DEFAULT_KENPOM_SNAPSHOT = ROOT / "data" / "source" / "kenpom-ratings.tsv"
 
 BOXSCORUS_URL = "https://www.boxscorus.com/ncaab/march-madness"
 BOXSCORUS_PAGE_REGEX = re.compile(
@@ -131,6 +132,12 @@ def parse_args() -> argparse.Namespace:
         help="Fetch a fresh Boxscorus page and overwrite the snapshot.",
     )
     parser.add_argument(
+        "--kenpom-snapshot",
+        type=Path,
+        default=DEFAULT_KENPOM_SNAPSHOT,
+        help="Local KenPom ratings snapshot (TSV).",
+    )
+    parser.add_argument(
         "--json-output",
         type=Path,
         default=DEFAULT_JSON_OUTPUT,
@@ -183,7 +190,42 @@ def extract_bracket_data(html: str) -> dict[str, Any]:
     return payload["props"]["pageProps"]["bracketData"]
 
 
-def build_team_entries(bracket_data: dict[str, Any]) -> list[dict[str, Any]]:
+def load_existing_payload(payload_path: Path) -> dict[str, Any] | None:
+    if not payload_path.exists():
+        return None
+    return json.loads(payload_path.read_text())
+
+
+def load_kenpom_snapshot(snapshot_path: Path) -> dict[str, dict[str, Any]]:
+    if not snapshot_path.exists():
+        raise FileNotFoundError(
+            f"KenPom snapshot not found at {snapshot_path}. Expected a local TSV snapshot."
+        )
+
+    frame = pd.read_csv(snapshot_path, sep="\t")
+    required_columns = {"slug", "team", "rank", "adj_em", "adj_o", "adj_d", "adj_t"}
+    missing_columns = required_columns.difference(frame.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"KenPom snapshot is missing required columns: {missing}")
+
+    ratings_by_slug: dict[str, dict[str, Any]] = {}
+    for row in frame.itertuples(index=False):
+        slug = str(row.slug).strip()
+        ratings_by_slug[slug] = {
+            "team": str(row.team).strip(),
+            "rank": int(row.rank),
+            "adjEm": float(row.adj_em),
+            "adjO": float(row.adj_o),
+            "adjD": float(row.adj_d),
+            "adjT": float(row.adj_t),
+        }
+    return ratings_by_slug
+
+
+def build_team_entries(
+    bracket_data: dict[str, Any], kenpom_ratings: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
     team_locations: dict[str, dict[str, Any]] = {}
 
     for region, seed_map in bracket_data["regions"].items():
@@ -208,6 +250,17 @@ def build_team_entries(bracket_data: dict[str, Any]) -> list[dict[str, Any]]:
     team_entries: list[dict[str, Any]] = []
     for slug, info in sorted(bracket_data["teams"].items(), key=lambda item: item[1]["name"]):
         location = team_locations.get(slug, {})
+        kenpom = kenpom_ratings.get(slug)
+        if not kenpom:
+            raise KeyError(f"Missing KenPom snapshot entry for team slug '{slug}'.")
+
+        boxscorus_ratings = {
+            "elo": float(info["elo"]),
+            "pace": float(info["pace"]),
+            "adjOff": float(info["adjOff"]),
+            "adjDef": float(info["adjDef"]),
+            "netRating": round(float(info["adjOff"]) - float(info["adjDef"]), 2),
+        }
         team_entries.append(
             {
                 "slug": slug,
@@ -216,11 +269,15 @@ def build_team_entries(bracket_data: dict[str, Any]) -> list[dict[str, Any]]:
                 "region": location.get("region"),
                 "playInTeam": bool(location.get("playInTeam", False)),
                 "color": info["color"],
-                "elo": float(info["elo"]),
-                "pace": float(info["pace"]),
-                "adjOff": float(info["adjOff"]),
-                "adjDef": float(info["adjDef"]),
-                "netRating": round(float(info["adjOff"]) - float(info["adjDef"]), 2),
+                "elo": boxscorus_ratings["elo"],
+                "pace": boxscorus_ratings["pace"],
+                "adjOff": boxscorus_ratings["adjOff"],
+                "adjDef": boxscorus_ratings["adjDef"],
+                "netRating": boxscorus_ratings["netRating"],
+                "ratings": {
+                    "boxscorus": boxscorus_ratings,
+                    "kenpom": kenpom,
+                },
                 "sourceOdds": {
                     "r64": float(info["r64"]),
                     "r32": float(info["r32"]),
@@ -236,6 +293,31 @@ def build_team_entries(bracket_data: dict[str, Any]) -> list[dict[str, Any]]:
     return team_entries
 
 
+def attach_ratings_to_existing_teams(
+    teams: list[dict[str, Any]], kenpom_ratings: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    next_teams: list[dict[str, Any]] = []
+    for team in teams:
+        slug = team["slug"]
+        kenpom = kenpom_ratings.get(slug)
+        if not kenpom:
+            raise KeyError(f"Missing KenPom snapshot entry for team slug '{slug}'.")
+        boxscorus_ratings = {
+            "elo": float(team["elo"]),
+            "pace": float(team["pace"]),
+            "adjOff": float(team["adjOff"]),
+            "adjDef": float(team["adjDef"]),
+            "netRating": float(team["netRating"]),
+        }
+        next_team = dict(team)
+        next_team["ratings"] = {
+            "boxscorus": boxscorus_ratings,
+            "kenpom": kenpom,
+        }
+        next_teams.append(next_team)
+    return next_teams
+
+
 def build_slug_lookup(bracket_data: dict[str, Any]) -> dict[str, str]:
     lookup: dict[str, str] = {}
 
@@ -243,6 +325,15 @@ def build_slug_lookup(bracket_data: dict[str, Any]) -> dict[str, str]:
         lookup[normalize_key(info["name"])] = slug
         lookup[normalize_key(slug.replace("-", " "))] = slug
 
+    lookup.update(ROSTER_ALIASES)
+    return lookup
+
+
+def build_slug_lookup_from_teams(teams: list[dict[str, Any]]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for team in teams:
+        lookup[normalize_key(team["name"])] = team["slug"]
+        lookup[normalize_key(team["slug"].replace("-", " "))] = team["slug"]
     lookup.update(ROSTER_ALIASES)
     return lookup
 
@@ -507,27 +598,60 @@ def build_games(bracket_data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def build_payload(args: argparse.Namespace) -> dict[str, Any]:
-    html, html_source = load_boxscorus_html(args)
-    bracket_data = extract_bracket_data(html)
-    slug_lookup = build_slug_lookup(bracket_data)
-    participants, roster_summary = build_participants(args.workbook, slug_lookup)
-    teams = build_team_entries(bracket_data)
-    games = build_games(bracket_data)
+    kenpom_ratings = load_kenpom_snapshot(args.kenpom_snapshot)
+    existing_payload = None
+    if not args.html and not args.refresh and not args.snapshot.exists():
+        existing_payload = load_existing_payload(args.json_output)
+
+    if existing_payload:
+        slug_lookup = build_slug_lookup_from_teams(existing_payload["teams"])
+        participants, roster_summary = build_participants(args.workbook, slug_lookup)
+        teams = attach_ratings_to_existing_teams(existing_payload["teams"], kenpom_ratings)
+        games = existing_payload["games"]
+        season = int(existing_payload["meta"]["season"])
+        boxscorus_source = dict(existing_payload["meta"].get("boxscorusSource", {}))
+        if "loadedFrom" not in boxscorus_source:
+            boxscorus_source["loadedFrom"] = f"existing payload ({args.json_output})"
+    else:
+        html, html_source = load_boxscorus_html(args)
+        bracket_data = extract_bracket_data(html)
+        slug_lookup = build_slug_lookup(bracket_data)
+        participants, roster_summary = build_participants(args.workbook, slug_lookup)
+        teams = build_team_entries(bracket_data, kenpom_ratings)
+        games = build_games(bracket_data)
+        season = 2026
+        boxscorus_source = {
+            "url": BOXSCORUS_URL,
+            "loadedFrom": html_source,
+            "note": "Bracket snapshot and team ratings extracted from the Boxscorus __NEXT_DATA__ payload.",
+        }
 
     payload = {
         "meta": {
             "title": "Marshall NCAA Tournament Simulator",
-            "season": 2026,
+            "season": season,
             "generatedAt": datetime.now(timezone.utc).isoformat(),
-            "boxscorusSource": {
-                "url": BOXSCORUS_URL,
-                "loadedFrom": html_source,
-                "note": "Bracket snapshot and team ratings extracted from the Boxscorus __NEXT_DATA__ payload.",
+            "boxscorusSource": boxscorus_source,
+            "kenpomSource": {
+                "loadedFrom": str(args.kenpom_snapshot),
+                "note": "Local snapshot of the public KenPom front-page ratings table.",
             },
             "simulation": {
                 "defaultRuns": 10000,
+                "defaultModel": "boxscorus",
                 "eloScale": 320,
                 "modelNote": "Round-of-64 uses Boxscorus published probabilities when directly available; all other open games use a Boxscorus Elo-based win curve.",
+                "kenpomNationalAverage": 100.5,
+                "models": {
+                    "boxscorus": {
+                        "label": "Boxscorus",
+                        "note": "Uses Boxscorus round-of-64 published probabilities when available, then Boxscorus Elo for remaining games.",
+                    },
+                    "kenpom": {
+                        "label": "KenPom",
+                        "note": "Uses the local KenPom snapshot for winner selection and simulated game scores.",
+                    },
+                },
             },
             "pool": {
                 "entryCount": roster_summary["entryCount"],

@@ -108,7 +108,8 @@ input, select, button { font: inherit; }
   white-space: nowrap;
 }
 
-.seed-group input {
+.seed-group input,
+.seed-group select {
   width: 100px;
   padding: 5px 8px;
   border-radius: 7px;
@@ -118,7 +119,8 @@ input, select, button { font: inherit; }
   font-size: 0.85rem;
 }
 
-.seed-group input:focus {
+.seed-group input:focus,
+.seed-group select:focus {
   outline: none;
   border-color: var(--accent-soft);
 }
@@ -396,6 +398,15 @@ button:disabled { opacity: 0.4; cursor: default; }
   min-width: 0;
 }
 
+.team-slot .score {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.64rem;
+  color: var(--muted);
+  flex-shrink: 0;
+  min-width: 22px;
+  text-align: right;
+}
+
 .team-slot .win-prob {
   font-family: "IBM Plex Mono", monospace;
   font-size: 0.62rem;
@@ -421,6 +432,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 }
 
 .team-slot.winner .seed,
+.team-slot.winner .score,
 .team-slot.winner .win-prob {
   color: var(--accent);
 }
@@ -438,6 +450,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 
 .team-slot.simulated .name,
 .team-slot.simulated .seed,
+.team-slot.simulated .score,
 .team-slot.simulated .win-prob {
   color: var(--accent);
 }

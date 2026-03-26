@@ -88,7 +88,10 @@
       teamIndexBySlug: teamIndexBySlug,
       teamNameBySlug: teamNameBySlug,
       possibleWinnerSlugsByGameId: possibleWinnerSlugsByGameId,
+      defaultModel: String((data.meta && data.meta.simulation && data.meta.simulation.defaultModel) || "boxscorus"),
+      availableModels: Object.keys((data.meta && data.meta.simulation && data.meta.simulation.models) || { boxscorus: {} }),
       eloScale: Number(data.meta.simulation.eloScale || 320),
+      kenpomNationalAverage: Number(data.meta.simulation.kenpomNationalAverage || 100.5),
       defaultRuns: Number(data.meta.simulation.defaultRuns || 10000),
     };
   }
@@ -254,8 +257,111 @@
     return resolveSlot(getSlotByKey(game, parsed.slotKey), winnersByGameId);
   }
 
-  function getGameProbability(compiled, game, teamA, teamB) {
-    if (game.publishedProbability) {
+  function normalizeModelKey(compiled, modelKey) {
+    const normalized = String(modelKey || compiled.defaultModel || "boxscorus");
+    if (compiled.availableModels.indexOf(normalized) >= 0) {
+      return normalized;
+    }
+    return compiled.defaultModel || "boxscorus";
+  }
+
+  function getTeamRatings(compiled, teamSlug, modelKey) {
+    const teamInfo = compiled.teams[compiled.teamIndexBySlug.get(teamSlug)];
+    if (!teamInfo) {
+      return null;
+    }
+    const normalizedModelKey = normalizeModelKey(compiled, modelKey);
+    if (teamInfo.ratings && teamInfo.ratings[normalizedModelKey]) {
+      return teamInfo.ratings[normalizedModelKey];
+    }
+    return teamInfo;
+  }
+
+  function clampNumber(value, minValue, maxValue) {
+    return Math.max(minValue, Math.min(maxValue, value));
+  }
+
+  function sampleNormal(rng, mean, standardDeviation) {
+    if (!standardDeviation) {
+      return mean;
+    }
+    let u = 0;
+    let v = 0;
+    while (!u) { u = rng(); }
+    while (!v) { v = rng(); }
+    const magnitude = Math.sqrt(-2 * Math.log(u));
+    const angle = 2 * Math.PI * v;
+    return mean + (standardDeviation * magnitude * Math.cos(angle));
+  }
+
+  function sampleTeamPoints(rng, possessions, offensiveRating) {
+    const meanPoints = possessions * offensiveRating / 100;
+    const standardDeviation = Math.max(4, Math.sqrt(possessions) * 1.45);
+    return Math.max(40, Math.round(sampleNormal(rng, meanPoints, standardDeviation)));
+  }
+
+  function simulateKenPomGame(compiled, teamA, teamB, rng) {
+    const ratingsA = getTeamRatings(compiled, teamA, "kenpom");
+    const ratingsB = getTeamRatings(compiled, teamB, "kenpom");
+    const averageEfficiency = compiled.kenpomNationalAverage || 100.5;
+    const tempoMean = clampNumber((ratingsA.adjT + ratingsB.adjT) / 2, 58, 78);
+    const possessions = clampNumber(Math.round(sampleNormal(rng, tempoMean, 3.6)), 54, 84);
+    const offensiveRatingA = clampNumber((ratingsA.adjO * ratingsB.adjD) / averageEfficiency, 84, 132);
+    const offensiveRatingB = clampNumber((ratingsB.adjO * ratingsA.adjD) / averageEfficiency, 84, 132);
+    let scoreA = sampleTeamPoints(rng, possessions, offensiveRatingA);
+    let scoreB = sampleTeamPoints(rng, possessions, offensiveRatingB);
+
+    let overtimeCount = 0;
+    while (scoreA === scoreB && overtimeCount < 6) {
+      const overtimePossessions = clampNumber(Math.round(tempoMean / 8), 6, 12);
+      scoreA += Math.max(2, Math.round(sampleNormal(rng, overtimePossessions * offensiveRatingA / 100, 2.4)));
+      scoreB += Math.max(2, Math.round(sampleNormal(rng, overtimePossessions * offensiveRatingB / 100, 2.4)));
+      overtimeCount += 1;
+    }
+
+    if (scoreA === scoreB) {
+      if (rng() < 0.5) {
+        scoreA += 1;
+      } else {
+        scoreB += 1;
+      }
+    }
+
+    return {
+      winner: scoreA > scoreB ? teamA : teamB,
+      teamAScore: scoreA,
+      teamBScore: scoreB,
+      overtimeCount: overtimeCount,
+    };
+  }
+
+  function simulateGameOutcome(compiled, game, teamA, teamB, rng, modelKey, lockedWinner) {
+    if (lockedWinner) {
+      return {
+        winner: lockedWinner,
+        teamAScore: null,
+        teamBScore: null,
+        overtimeCount: 0,
+      };
+    }
+
+    const normalizedModelKey = normalizeModelKey(compiled, modelKey);
+    if (normalizedModelKey === "kenpom") {
+      return simulateKenPomGame(compiled, teamA, teamB, rng);
+    }
+
+    const probabilityA = getGameProbability(compiled, game, teamA, teamB, normalizedModelKey);
+    return {
+      winner: rng() < probabilityA ? teamA : teamB,
+      teamAScore: null,
+      teamBScore: null,
+      overtimeCount: 0,
+    };
+  }
+
+  function getGameProbability(compiled, game, teamA, teamB, modelKey) {
+    const normalizedModelKey = normalizeModelKey(compiled, modelKey);
+    if (normalizedModelKey === "boxscorus" && game.publishedProbability) {
       const published = game.publishedProbability;
       if (published.teamA === teamA && published.teamB === teamB) {
         return published.probabilityA;
@@ -265,8 +371,14 @@
       }
     }
 
-    const teamInfoA = compiled.teams[compiled.teamIndexBySlug.get(teamA)];
-    const teamInfoB = compiled.teams[compiled.teamIndexBySlug.get(teamB)];
+    if (normalizedModelKey === "kenpom") {
+      const teamInfoA = getTeamRatings(compiled, teamA, "kenpom");
+      const teamInfoB = getTeamRatings(compiled, teamB, "kenpom");
+      return 1 / (1 + Math.exp(-((teamInfoA.adjEm - teamInfoB.adjEm) / 9.5)));
+    }
+
+    const teamInfoA = getTeamRatings(compiled, teamA, "boxscorus");
+    const teamInfoB = getTeamRatings(compiled, teamB, "boxscorus");
     return 1 / (1 + Math.pow(10, (teamInfoB.elo - teamInfoA.elo) / compiled.eloScale));
   }
 
@@ -439,9 +551,13 @@
     const seed = Number(options && options.seed) >>> 0;
     const rng = buildSeededRng(seed || Date.now());
     const lockedResults = sanitizeLockedResults(compiled, options && options.lockedResults);
+    const modelKey = normalizeModelKey(compiled, options && options.modelKey);
+    const firstPrize = 9600;
+    const secondPrize = 3200;
 
     const participantCount = compiled.participants.length;
     const scoreTotals = new Float64Array(participantCount);
+    const valueTotals = new Float64Array(participantCount);
     const winCounts = new Uint32Array(participantCount);
     const outrightWinCounts = new Uint32Array(participantCount);
     const tiedWinCounts = new Uint32Array(participantCount);
@@ -480,11 +596,8 @@
         }
 
         const lockedWinner = resolveSelectionWinner(compiled, game, lockedResults[game.id], winnersByGameId);
-        let winner = lockedWinner;
-        if (!winner) {
-          const probabilityA = getGameProbability(compiled, game, teamA, teamB);
-          winner = rng() < probabilityA ? teamA : teamB;
-        }
+        const outcome = simulateGameOutcome(compiled, game, teamA, teamB, rng, modelKey, lockedWinner);
+        const winner = outcome.winner;
 
         winnersByGameId[game.id] = winner;
         gameWinCounts[game.id][winner] = (gameWinCounts[game.id][winner] || 0) + 1;
@@ -537,18 +650,31 @@
       });
       if (winners.length === 1) {
         outrightWinCounts[winners[0]] += 1;
+        valueTotals[winners[0]] += firstPrize;
       } else if (winners.length > 1) {
         simulationsWithTieForFirst += 1;
+        const splitFirstPrize = (firstPrize + secondPrize) / winners.length;
         winners.forEach(function eachTiedWinner(index) {
           tiedWinCounts[index] += 1;
+          valueTotals[index] += splitFirstPrize;
         });
       }
 
       secondPlace.forEach(function eachSecond(index) {
         secondCounts[index] += 1;
       });
-      if (secondPlace.length === 1) {
-        outrightSecondCounts[secondPlace[0]] += 1;
+      if (winners.length === 1) {
+        if (secondPlace.length === 1) {
+          outrightSecondCounts[secondPlace[0]] += 1;
+          valueTotals[secondPlace[0]] += secondPrize;
+        } else if (secondPlace.length > 1) {
+          simulationsWithTieForSecond += 1;
+          const splitSecondPrize = secondPrize / secondPlace.length;
+          secondPlace.forEach(function eachTiedSecond(index) {
+            tiedSecondCounts[index] += 1;
+            valueTotals[index] += splitSecondPrize;
+          });
+        }
       } else if (secondPlace.length > 1) {
         simulationsWithTieForSecond += 1;
         secondPlace.forEach(function eachTiedSecond(index) {
@@ -580,6 +706,7 @@
         teamCount: participant.teamCount,
         currentPoints: currentRow ? currentRow.currentPoints : 0,
         averageScore: scoreTotals[participant.index] / totalRuns,
+        expectedValue: valueTotals[participant.index] / totalRuns,
         minScore: minScores[participant.index] === 65535 ? 0 : minScores[participant.index],
         maxScore: maxScores[participant.index],
         winRate: winCounts[participant.index] / totalRuns,
@@ -593,6 +720,9 @@
     });
 
     participants.sort(function byProjection(a, b) {
+      if (b.expectedValue !== a.expectedValue) {
+        return b.expectedValue - a.expectedValue;
+      }
       if (b.winRate !== a.winRate) {
         return b.winRate - a.winRate;
       }
@@ -628,6 +758,7 @@
     });
 
     return {
+      modelKey: modelKey,
       seed: seed || 0,
       simulations: totalRuns,
       lockedResults: lockedResults,
@@ -646,9 +777,11 @@
     const seed = Number(options && options.seed) >>> 0;
     const rng = buildSeededRng(seed || Date.now());
     const lockedResults = sanitizeLockedResults(compiled, options && options.lockedResults);
+    const modelKey = normalizeModelKey(compiled, options && options.modelKey);
     const participantCount = compiled.participants.length;
 
     const winnersByGameId = {};
+    const gameScoresById = {};
     const teamPoints = new Uint16Array(compiled.teams.length);
 
     compiled.games.forEach(function eachGame(game) {
@@ -658,12 +791,24 @@
         return;
       }
       const lockedWinner = resolveSelectionWinner(compiled, game, lockedResults[game.id], winnersByGameId);
-      let winner = lockedWinner;
-      if (!winner) {
-        const probabilityA = getGameProbability(compiled, game, teamA, teamB);
-        winner = rng() < probabilityA ? teamA : teamB;
-      }
+      const outcome = simulateGameOutcome(compiled, game, teamA, teamB, rng, modelKey, lockedWinner);
+      const winner = outcome.winner;
       winnersByGameId[game.id] = winner;
+      if (outcome.teamAScore !== null && outcome.teamBScore !== null) {
+        gameScoresById[game.id] = {
+          teamAScore: outcome.teamAScore,
+          teamBScore: outcome.teamBScore,
+          overtimeCount: outcome.overtimeCount,
+          modelKey: modelKey,
+        };
+      } else if (game.sourceResult && game.sourceResult.scoreA !== undefined && game.sourceResult.scoreB !== undefined) {
+        gameScoresById[game.id] = {
+          teamAScore: Number(game.sourceResult.scoreA),
+          teamBScore: Number(game.sourceResult.scoreB),
+          overtimeCount: 0,
+          modelKey: "actual",
+        };
+      }
       if (game.points > 0) {
         teamPoints[compiled.teamIndexBySlug.get(winner)] += game.points;
       }
@@ -698,7 +843,9 @@
     }
 
     return {
+      modelKey: modelKey,
       winnersByGameId: winnersByGameId,
+      gameScoresById: gameScoresById,
       poolWinnerIndices: poolWinnerIndices,
       topScore: topScore,
       secondScore: secondScore,

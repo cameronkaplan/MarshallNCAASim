@@ -24,6 +24,13 @@
           <label for="simulation-count">Sims</label>
           <input id="simulation-count" type="number" min="1" step="1" />
         </div>
+        <div class="seed-group">
+          <label for="model-select">Model</label>
+          <select id="model-select">
+            <option value="boxscorus">Boxscorus</option>
+            <option value="kenpom">KenPom</option>
+          </select>
+        </div>
         <button class="button-ghost" id="reset-results">Reset Locks</button>
       </div>
     </header>
@@ -97,6 +104,7 @@
                 <th>Win %</th>
                 <th>2nd %</th>
                 <th>Top 2 %</th>
+                <th>Value</th>
                 <th>Range</th>
                 <th>Teams</th>
               </tr>

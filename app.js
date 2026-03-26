@@ -19,8 +19,10 @@
     liveResults:   loadLiveResults(),
     seed: loadedSettings.seed || Math.floor(Date.now() % 1000000000),
     simulations: normalizeSimulationCount(loadedSettings.simulations),
+    modelKey: normalizeModelKey(loadedSettings.modelKey || loadedSettings.model),
     results: null,
     sampleWinners: null,
+    sampleGameScores: null,
     activeTab: "bracket",
     dirty: false,
   };
@@ -28,10 +30,12 @@
   const numberFormat   = new Intl.NumberFormat("en-US");
   const percentFormat  = new Intl.NumberFormat("en-US", { style: "percent", maximumFractionDigits: 1, minimumFractionDigits: 1 });
   const scoreFormat    = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  const currencyFormat = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0, maximumFractionDigits: 2 });
 
   const els = {
     seed:               document.querySelector("#simulation-seed"),
     simulationCount:    document.querySelector("#simulation-count"),
+    modelSelect:        document.querySelector("#model-select"),
     simulateOnce:       document.querySelector("#simulate-once"),
     runButton:          document.querySelector("#run-simulations"),
     randomizeSeed:      document.querySelector("#randomize-seed"),
@@ -69,6 +73,7 @@
   function init() {
     els.seed.value = state.seed;
     els.simulationCount.value = state.simulations;
+    els.modelSelect.value = state.modelKey;
     updateRunButtonLabel();
     if (blankScenario && els.scenarioIndicator) {
       els.scenarioIndicator.hidden = false;
@@ -161,6 +166,7 @@
     window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({
       seed: state.seed,
       simulations: state.simulations,
+      modelKey: state.modelKey,
     }));
   }
 
@@ -172,6 +178,45 @@
       compiled,
       Object.assign({}, core.defaultLockedResults(compiled), state.liveResults)
     );
+  }
+
+  function getAvailableModels() {
+    const configured = (data.meta && data.meta.simulation && data.meta.simulation.models) || {};
+    const keys = Object.keys(configured);
+    if (keys.length) {
+      return keys;
+    }
+    return ["boxscorus"];
+  }
+
+  function normalizeModelKey(value) {
+    const availableModels = getAvailableModels();
+    const candidate = String(value || (data.meta && data.meta.simulation && data.meta.simulation.defaultModel) || "boxscorus");
+    return availableModels.indexOf(candidate) >= 0 ? candidate : availableModels[0];
+  }
+
+  function getModelMeta(modelKey) {
+    const models = (data.meta && data.meta.simulation && data.meta.simulation.models) || {};
+    return models[normalizeModelKey(modelKey)] || {};
+  }
+
+  function getModelLabel(modelKey) {
+    return getModelMeta(modelKey).label || normalizeModelKey(modelKey);
+  }
+
+  function clearSimulationOutputs(markDirty) {
+    state.results = null;
+    state.sampleWinners = null;
+    state.sampleGameScores = null;
+    if (markDirty) {
+      state.dirty = true;
+    }
+    els.exportSummaryButton.disabled = true;
+    els.exportScoresButton.disabled = true;
+    els.winnerBanner.hidden = true;
+    renderBracket(null, null, null);
+    renderStatsBar();
+    renderOutlookTab();
   }
 
   // ─── Tabs ────────────────────────────────────────────────────
@@ -228,13 +273,20 @@
       updateRunButtonLabel();
     });
 
+    els.modelSelect.addEventListener("change", function () {
+      state.modelKey = normalizeModelKey(els.modelSelect.value);
+      els.modelSelect.value = state.modelKey;
+      saveSettings();
+      clearSimulationOutputs(true);
+      if (state.activeTab === "leaders") { renderLeadersTab(); }
+      renderStatusBar(getModelLabel(state.modelKey) + " selected. Rerun simulations to refresh projections.");
+    });
+
     els.resetButton.addEventListener("click", function () {
       state.lockedResults = getBaselineLockedResults();
-      state.sampleWinners = null;
-      state.dirty = true;
       saveLockedResults();
-      els.winnerBanner.hidden = true;
-      renderBracket(null, state.results ? state.results.gameProbabilities : null);
+      clearSimulationOutputs(true);
+      if (state.activeTab === "leaders") { renderLeadersTab(); }
       renderStatusBar(blankScenario
         ? "Blank scenario reset to an empty bracket."
         : "Manual locks cleared. All completed game results restored.");
@@ -263,11 +315,8 @@
         nextLocked[gameId] = teamSlug;
       }
       state.lockedResults = core.normalizeRequestedSelections(compiled, nextLocked);
-      state.sampleWinners = null;
-      state.dirty = true;
       saveLockedResults();
-      els.winnerBanner.hidden = true;
-      renderBracket(null, state.results ? state.results.gameProbabilities : null);
+      clearSimulationOutputs(true);
       if (state.activeTab === "leaders") { renderLeadersTab(); }
       renderStatusBar("Result updated. Rerun simulations to refresh projections.");
     });
@@ -282,11 +331,8 @@
       delete nextLocked[gameId];
       if (nextValue) { nextLocked[gameId] = nextValue; }
       state.lockedResults = core.normalizeRequestedSelections(compiled, nextLocked);
-      state.sampleWinners = null;
-      state.dirty = true;
       saveLockedResults();
-      els.winnerBanner.hidden = true;
-      renderBracket(null, state.results ? state.results.gameProbabilities : null);
+      clearSimulationOutputs(true);
       if (state.activeTab === "leaders") { renderLeadersTab(); }
       renderStatusBar("Override applied. Rerun simulations to refresh projections.");
     });
@@ -299,21 +345,26 @@
     const oneResult = core.runOneBracket(compiled, {
       seed: state.seed,
       lockedResults: state.lockedResults,
+      modelKey: state.modelKey,
     });
     state.sampleWinners = oneResult.winnersByGameId;
+    state.sampleGameScores = oneResult.gameScoresById || null;
 
     const winnerNames = oneResult.poolWinnerIndices
       .map(function (i) { return compiled.participants[i].name; }).join(" & ");
     const isTie = oneResult.poolWinnerIndices.length > 1;
     els.winnerBannerText.textContent =
       (isTie ? "Tied: " : "Pool winner: ") +
-      winnerNames + " · " + numberFormat.format(oneResult.topScore) + " pts";
+      winnerNames + " · " + numberFormat.format(oneResult.topScore) + " pts · " + getModelLabel(state.modelKey);
     els.winnerBanner.hidden = false;
 
     // Switch to bracket tab so user sees the result
     switchTab("bracket");
-    renderBracket(oneResult.winnersByGameId, state.results ? state.results.gameProbabilities : null);
-    renderStatusBar("Simulated 1 outcome · seed " + numberFormat.format(state.seed) + ".");
+    renderBracket(oneResult.winnersByGameId, state.results ? state.results.gameProbabilities : null, state.sampleGameScores);
+    renderStatusBar(
+      "Simulated 1 outcome with " + getModelLabel(state.modelKey) +
+      " · seed " + numberFormat.format(state.seed) + "."
+    );
   }
 
   // ─── Run Simulations ─────────────────────────────────────────
@@ -321,17 +372,21 @@
   function runSimulations() {
     saveLockedResults();
     els.runButton.disabled = true;
-    renderStatusBar("Running " + numberFormat.format(state.simulations) + " simulations…");
+    renderStatusBar(
+      "Running " + numberFormat.format(state.simulations) +
+      " simulations with " + getModelLabel(state.modelKey) + "…"
+    );
 
     window.setTimeout(function () {
       state.results = core.runSimulations(compiled, {
         simulations: state.simulations,
         seed: state.seed,
         lockedResults: state.lockedResults,
+        modelKey: state.modelKey,
       });
       state.dirty = false;
       els.runButton.disabled = false;
-      renderBracket(state.sampleWinners, state.results.gameProbabilities);
+      renderBracket(state.sampleWinners, state.results.gameProbabilities, state.sampleGameScores);
       renderStatsBar();
       renderOutlookTab();
       if (state.activeTab === "leaders") { renderLeadersTab(); }
@@ -340,14 +395,14 @@
       switchTab("outlook");
       renderStatusBar(
         numberFormat.format(state.simulations) + " sims complete · seed " + numberFormat.format(state.seed) +
-        " · probabilities shown in bracket."
+        " · " + getModelLabel(state.modelKey) + " probabilities shown in bracket."
       );
     }, 10);
   }
 
   // ─── Bracket ─────────────────────────────────────────────────
 
-  function renderBracket(sampleWinners, gameProbabilities) {
+  function renderBracket(sampleWinners, gameProbabilities, sampleGameScores) {
     const gameStates = core.getGameStates(compiled, state.lockedResults);
     const byId = {};
     gameStates.forEach(function (g) { byId[g.id] = g; });
@@ -361,7 +416,7 @@
       return Math.round(prob * 100) + "%";
     }
 
-    function renderTeamSlot(gameId, slug, label, isWinner, isSimulated, prob) {
+    function renderTeamSlot(gameId, slug, label, isWinner, isSimulated, prob, score) {
       if (!slug) {
         return [
           "<div class=\"team-slot muted-slot\">",
@@ -378,6 +433,9 @@
       const probHtml = (prob !== null && prob !== undefined)
         ? "<span class=\"win-prob\">" + escapeHtml(probPct(prob)) + "</span>"
         : "";
+      const scoreHtml = (score !== null && score !== undefined)
+        ? "<span class=\"score\">" + escapeHtml(String(score)) + "</span>"
+        : "";
       const lockHtml = (isWinner && !isSimulated)
         ? "<svg class=\"lock-icon\" viewBox=\"0 0 8 10\" fill=\"currentColor\" aria-hidden=\"true\">" +
           "<rect x=\"1\" y=\"4.5\" width=\"6\" height=\"5\" rx=\"1\"/>" +
@@ -390,6 +448,7 @@
         " data-game-id=\"" + escapeHtml(gameId) + "\">",
         "<span class=\"seed\">" + escapeHtml(String(seed)) + "</span>",
         "<span class=\"name\">" + escapeHtml(name) + "</span>",
+        scoreHtml,
         lockHtml,
         probHtml,
         "</div>",
@@ -426,13 +485,39 @@
 
       const probA = (probs && slugA) ? probs[slugA] : null;
       const probB = (probs && slugB) ? probs[slugB] : null;
+      const gameScores = sampleGameScores && sampleGameScores[game.id]
+        ? sampleGameScores[game.id]
+        : (
+          game.sourceResult &&
+          game.sourceResult.scoreA !== undefined &&
+          game.sourceResult.scoreB !== undefined
+        ) ? {
+          teamAScore: game.sourceResult.scoreA,
+          teamBScore: game.sourceResult.scoreB,
+        } : null;
 
       const classes = ["matchup"];
       if (extraClass) { classes.push(extraClass); }
       if (game.requestedSelection) { classes.push("has-override"); }
 
-      const slotAHtml = renderTeamSlot(game.id, slugA, labelA, winA, isSimulated && winA, probA);
-      const slotBHtml = renderTeamSlot(game.id, slugB, labelB, winB, isSimulated && winB, probB);
+      const slotAHtml = renderTeamSlot(
+        game.id,
+        slugA,
+        labelA,
+        winA,
+        isSimulated && winA,
+        probA,
+        gameScores ? gameScores.teamAScore : null
+      );
+      const slotBHtml = renderTeamSlot(
+        game.id,
+        slugB,
+        labelB,
+        winB,
+        isSimulated && winB,
+        probB,
+        gameScores ? gameScores.teamBScore : null
+      );
 
       // For games with unresolved slots: show compact override select
       let selectHtml = "";
@@ -509,9 +594,12 @@
   // ─── Stats Bar ───────────────────────────────────────────────
 
   function renderStatsBar() {
-    if (!state.results) { return; }
+    if (!state.results) {
+      els.statsBar.innerHTML = "";
+      return;
+    }
     const r = state.results;
-    const top = r.participants[0];
+    const top = r.participants.slice().sort(function (a, b) { return b.winRate - a.winRate; })[0];
     const second = r.participants.slice().sort(function (a, b) { return b.secondRate - a.secondRate; })[0];
     const tieRate = r.simulationsWithTieForFirst / r.simulations;
 
@@ -617,7 +705,10 @@
   // ─── Outlook Tab (Monte Carlo projections) ───────────────────
 
   function renderOutlookTab() {
-    if (!state.results) { return; }
+    if (!state.results) {
+      els.leaderboardBody.innerHTML = "";
+      return;
+    }
     const eliminatedSlugs = computeEliminatedSlugs();
     els.leaderboardBody.innerHTML = state.results.participants
       .map(function (p, index) {
@@ -630,6 +721,7 @@
           "<td>" + percentFormat.format(p.winRate) + "</td>",
           "<td>" + percentFormat.format(p.secondRate) + "</td>",
           "<td>" + percentFormat.format(p.topTwoRate) + "</td>",
+          "<td>" + currencyFormat.format(p.expectedValue || 0) + "</td>",
           "<td>" + numberFormat.format(p.minScore) + "–" + numberFormat.format(p.maxScore) + "</td>",
           "<td>" + numberFormat.format(p.teamCount) + "</td>",
           "</tr>",
@@ -641,7 +733,7 @@
   // ─── Status Bar ──────────────────────────────────────────────
 
   function renderStatusBar(message) {
-    const dirty = state.dirty ? "<span class=\"dirty-flag\"> · Overrides pending — rerun projections.</span>" : "";
+    const dirty = state.dirty ? "<span class=\"dirty-flag\"> · Projections stale — rerun.</span>" : "";
     els.statusBar.innerHTML = "<span>" + escapeHtml(message) + dirty + "</span>";
   }
 
@@ -653,7 +745,12 @@
       return "<li>" + escapeHtml(r) + "</li>";
     }).join("") + "</ul>";
     const generatedAt = new Date(data.meta.generatedAt).toLocaleDateString();
-    els.footerMeta.innerHTML = "Data from Boxscorus · Generated " + escapeHtml(generatedAt);
+    const footerBits = ["Data from Boxscorus"];
+    if (data.meta.kenpomSource) {
+      footerBits.push("KenPom snapshot");
+    }
+    footerBits.push("Generated " + generatedAt);
+    els.footerMeta.innerHTML = escapeHtml(footerBits.join(" · "));
   }
 
   // ─── ESPN Live Sync ───────────────────────────────────────────
@@ -949,8 +1046,8 @@
         if (lockedChanged) {
           state.lockedResults = normalizedLockedResults;
           saveLockedResults();
-          state.dirty = true;
-          renderBracket(null, state.results ? state.results.gameProbabilities : null);
+          clearSimulationOutputs(true);
+          if (state.activeTab === "leaders") { renderLeadersTab(); }
         }
 
         if (liveChanged || lockedChanged) {
@@ -1013,9 +1110,10 @@
   // ─── CSV Export ───────────────────────────────────────────────
 
   function buildSummaryCsv(results) {
-    const header = ["Participant","Current Points","Average Final Score","Win Rate","Outright Win Rate","Tied Win Rate","Second Rate","Top Two Rate","Min Score","Max Score","Teams"];
+    const header = ["Participant","Current Points","Average Final Score","Expected Value","Win Rate","Outright Win Rate","Tied Win Rate","Second Rate","Top Two Rate","Min Score","Max Score","Teams"];
     const rows = results.participants.map(function (p) {
       return [p.name, p.currentPoints, p.averageScore.toFixed(3),
+        p.expectedValue.toFixed(2),
         p.winRate.toFixed(6), p.outrightWinRate.toFixed(6), p.tiedWinRate.toFixed(6),
         p.secondRate.toFixed(6), p.topTwoRate.toFixed(6), p.minScore, p.maxScore, p.teamCount];
     });
